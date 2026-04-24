@@ -85,18 +85,18 @@ function buildGroups(
 ): Map<string, { parent: string; child: string }[]> {
   // Build adjacency lists (parent -> children) and track all nodes
   const childrenOf = new Map<string, Set<string>>();
-  const parentOf = new Map<string, Set<string>>();
   const allNodes = new Set<string>();
+  const firstAppearance = new Map<string, number>(); // track input order
 
-  for (const edge of edges) {
+  for (let i = 0; i < edges.length; i++) {
+    const edge = edges[i];
     allNodes.add(edge.parent);
     allNodes.add(edge.child);
+    if (!firstAppearance.has(edge.parent)) firstAppearance.set(edge.parent, i);
+    if (!firstAppearance.has(edge.child)) firstAppearance.set(edge.child, i);
 
     if (!childrenOf.has(edge.parent)) childrenOf.set(edge.parent, new Set());
     childrenOf.get(edge.parent)!.add(edge.child);
-
-    if (!parentOf.has(edge.child)) parentOf.set(edge.child, new Set());
-    parentOf.get(edge.child)!.add(edge.parent);
   }
 
   // Find root candidates: nodes that never appear as a child
@@ -105,10 +105,16 @@ function buildGroups(
     childNodes.add(edge.child);
   }
 
-  const roots: string[] = [];
-  for (const node of allNodes) {
-    if (!childNodes.has(node)) {
-      roots.push(node);
+  // Collect all roots (both true roots and cycle roots) in input order
+  const allRoots: string[] = [];
+  const seenRoots = new Set<string>();
+
+  // First: true roots (nodes that never appear as child) in input order
+  for (const edge of edges) {
+    const candidate = edge.parent;
+    if (!childNodes.has(candidate) && !seenRoots.has(candidate)) {
+      allRoots.push(candidate);
+      seenRoots.add(candidate);
     }
   }
 
@@ -142,8 +148,8 @@ function buildGroups(
     return groupEdges;
   }
 
-  // Process from known roots first
-  for (const root of roots.sort()) {
+  // Process from known roots first (already in input order)
+  for (const root of allRoots) {
     if (!visited.has(root)) {
       const group = collectGroup(root);
       groups.set(root, group);
@@ -151,10 +157,19 @@ function buildGroups(
   }
 
   // Handle pure cycles: nodes that all appear as children (no root found)
+  // Process them in input order of their first appearance
+  const cycleNodes: string[] = [];
   for (const node of allNodes) {
     if (!visited.has(node)) {
+      cycleNodes.push(node);
+    }
+  }
+  // Sort cycle nodes by first appearance in input
+  cycleNodes.sort((a, b) => (firstAppearance.get(a) ?? Infinity) - (firstAppearance.get(b) ?? Infinity));
+
+  for (const node of cycleNodes) {
+    if (!visited.has(node)) {
       // This node is part of a pure cycle
-      // BFS to collect all nodes in this cycle group
       const groupEdges: { parent: string; child: string }[] = [];
       const queue = [node];
       const groupNodes = new Set<string>();
@@ -178,7 +193,9 @@ function buildGroups(
 
       // Use lexicographically smallest node as root for pure cycles
       const sortedNodes = Array.from(groupNodes).sort();
-      groups.set(sortedNodes[0], groupEdges);
+      if (!groups.has(sortedNodes[0])) {
+        groups.set(sortedNodes[0], groupEdges);
+      }
     }
   }
 
@@ -253,7 +270,7 @@ function calculateDepth(tree: HierarchyNode): number {
   // Depth = number of nodes on the longest root-to-leaf path
   function dfs(node: HierarchyNode): number {
     const keys = Object.keys(node);
-    if (keys.length === 0) return 1;
+    if (keys.length === 0) return 0; // empty {} means no more nodes
     let maxChild = 0;
     for (const key of keys) {
       maxChild = Math.max(maxChild, dfs(node[key]));
@@ -267,32 +284,57 @@ function calculateDepth(tree: HierarchyNode): number {
 function processHierarchies(
   edges: { parent: string; child: string }[]
 ): { hierarchies: Hierarchy[]; summary: Summary } {
-  const groups = buildGroups(edges);
+  // Handle diamond/multi-parent case: first-encountered parent wins
+  const assignedParent = new Map<string, string>(); // child -> first parent
+  const filteredEdges: { parent: string; child: string }[] = [];
+  for (const edge of edges) {
+    if (!assignedParent.has(edge.child)) {
+      assignedParent.set(edge.child, edge.parent);
+      filteredEdges.push(edge);
+    }
+    // else: silently discard (multi-parent)
+  }
+
+  const groups = buildGroups(filteredEdges);
+  
+  // Track first appearance order of each root in the edge list
+  const firstAppearance = new Map<string, number>();
+  for (let i = 0; i < edges.length; i++) {
+    for (const node of [edges[i].parent, edges[i].child]) {
+      if (!firstAppearance.has(node)) firstAppearance.set(node, i);
+    }
+  }
+
   const hierarchies: Hierarchy[] = [];
   let totalTrees = 0;
   let totalCycles = 0;
   let largestTreeRoot = '';
   let largestDepth = 0;
 
+  // Collect all groups with their roots and build hierarchies
+  const groupEntries: { root: string; hierarchy: Hierarchy }[] = [];
+
   for (const [root, groupEdges] of groups) {
     const cyclic = hasCycle(groupEdges, root);
 
     if (cyclic) {
-      hierarchies.push({
+      const h: Hierarchy = {
         root,
         tree: {},
         has_cycle: true,
-      });
+      };
+      groupEntries.push({ root, hierarchy: h });
       totalCycles++;
     } else {
       const tree = buildTree(groupEdges, root);
       const depth = calculateDepth(tree);
 
-      hierarchies.push({
+      const h: Hierarchy = {
         root,
         tree,
         depth,
-      });
+      };
+      groupEntries.push({ root, hierarchy: h });
 
       totalTrees++;
 
@@ -303,15 +345,17 @@ function processHierarchies(
     }
   }
 
-  // Sort hierarchies by root (cycles first, then by root alphabetically)
-  hierarchies.sort((a, b) => {
-    if (a.has_cycle && !b.has_cycle) return -1;
-    if (!a.has_cycle && b.has_cycle) return 1;
-    return a.root.localeCompare(b.root);
+  // Sort by first appearance in input
+  groupEntries.sort((a, b) => {
+    const posA = firstAppearance.get(a.root) ?? Infinity;
+    const posB = firstAppearance.get(b.root) ?? Infinity;
+    return posA - posB;
   });
 
+  const sortedHierarchies = groupEntries.map(e => e.hierarchy);
+
   return {
-    hierarchies,
+    hierarchies: sortedHierarchies,
     summary: {
       total_trees: totalTrees,
       total_cycles: totalCycles,
